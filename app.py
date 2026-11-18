@@ -1,14 +1,32 @@
-import streamlit as st
-import google.generativeai as genai
-from PIL import Image
-from gtts import gTTS
-from io import BytesIO
-import sqlite3
-import uuid
-import time
-import tempfile
 import ast
+import base64
+import hashlib
+import hmac
+import json
+import pathlib
 import re
+import secrets
+import smtplib
+import sqlite3
+import threading
+import time
+import uuid
+from collections import defaultdict
+from contextlib import closing
+from email.message import EmailMessage
+from io import BytesIO
+
+import streamlit as st
+import streamlit.components.v1 as components
+from google import genai
+from google.genai import errors, types
+from gtts import gTTS
+from PIL import Image
+
+try:
+    from supabase import create_client
+except ImportError:          # rulare locală fără supabase instalat → doar SQLite, fără conturi
+    create_client = None
 
 # ==========================================
 # 1. CONFIGURARE PAGINĂ & CSS
@@ -20,7 +38,7 @@ st.markdown("""
     .stChatMessage { font-size: 16px; border-radius: 10px; }
     div.stButton > button:first-child { background-color: #ff4b4b; color: white; border-radius: 20px; }
     footer {visibility: hidden;}
-    
+
     .svg-container {
         background-color: white;
         padding: 20px;
@@ -31,7 +49,8 @@ st.markdown("""
         overflow: auto;
         box-shadow: 0 2px 5px rgba(0,0,0,0.1);
     }
-    
+    .svg-container img { max-width: 100%; height: auto; }
+
     /* Tabel styling pentru programe */
     table { width: 100%; border-collapse: collapse; }
     th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
@@ -39,318 +58,1249 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ==========================================
-# 2. SISTEM DE MEMORIE (Bază de date)
-# ==========================================
-def get_db_connection():
-    return sqlite3.connect('chat_history.db', check_same_thread=False)
+# Câte mesaje anterioare trimitem modelului ca context
+MAX_HISTORY_MESSAGES = 12
+# Fișierele urcate la Gemini expiră după 48h; le reîncărcăm înainte de asta
+FILE_MAX_AGE_SECONDS = 47 * 3600
+SVG_PATTERN = re.compile(r"<svg\b.*?</svg>", re.IGNORECASE | re.DOTALL)
+APP_NAME = "GymBro AI"
 
-def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS history 
-                 (session_id TEXT, role TEXT, content TEXT, timestamp REAL)''')
-    conn.commit()
-    conn.close()
+
+def _log(msg, err=None):
+    # Nu scriem niciodată chei / parole în log — doar tipul și textul scurt al erorii
+    print(f"[GymBro] {msg}" + (f": {type(err).__name__}: {str(err)[:200]}" if err else ""))
+
+
+def is_valid_uuid(value):
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+# Pod localStorage -> Python (ID-ul conversației + tokenul „ține-mă minte”), portat din Profesor ETTI.
+_SESSION_BRIDGE_DIR = pathlib.Path(__file__).resolve().parent / "session_bridge"
+_session_bridge = (
+    components.declare_component("gymbro_session_bridge", path=str(_SESSION_BRIDGE_DIR))
+    if (_SESSION_BRIDGE_DIR / "index.html").exists() else None
+)
+
+# ==========================================
+# 2. STOCARE: Supabase (cu conturi) sau SQLite (local, fără conturi)
+# ==========================================
+DB_PATH = "chat_history.db"
+
+
+@st.cache_resource(show_spinner=False)
+def _create_supabase_client(url, key):
+    return create_client(url, key)
+
+
+def get_supabase_client():
+    if create_client is None:
+        return None
+    try:
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
+    except Exception:
+        return None
+    if not url or not key:
+        return None
+    try:
+        return _create_supabase_client(url, key)
+    except Exception as e:
+        _log("Supabase: clientul nu a putut fi creat", e)
+        return None
+
+
+SB = get_supabase_client()
+ACCOUNTS_ENABLED = SB is not None
+
+
+def _sqlite():
+    return sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+
+
+if not ACCOUNTS_ENABLED:
+    with closing(_sqlite()) as _conn, _conn:
+        _conn.execute("""CREATE TABLE IF NOT EXISTS history
+                         (session_id TEXT, role TEXT, content TEXT, timestamp REAL)""")
+        _conn.execute("CREATE INDEX IF NOT EXISTS idx_history_session ON history (session_id, timestamp)")
+
+
+def session_register(session_id, user_id=None):
+    if not ACCOUNTS_ENABLED:
+        return
+    now = time.time()
+    try:
+        SB.table("gym_sessions").upsert(
+            {"session_id": session_id, "user_id": user_id, "created_at": now, "last_active": now},
+            ignore_duplicates=True,
+        ).execute()
+    except Exception as e:
+        _log("Înregistrare conversație eșuată", e)
+
+
+def session_owner(session_id):
+    """(există, user_id_proprietar_sau_None)."""
+    if not ACCOUNTS_ENABLED:
+        return False, None
+    try:
+        res = SB.table("gym_sessions").select("user_id").eq("session_id", session_id).limit(1).execute()
+        if not res.data:
+            return False, None
+        return True, res.data[0].get("user_id")
+    except Exception as e:
+        _log("Citire proprietar conversație eșuată", e)
+        return False, None
+
 
 def save_message_to_db(session_id, role, content):
+    if not ACCOUNTS_ENABLED:
+        try:
+            with closing(_sqlite()) as conn, conn:
+                conn.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (session_id, role, content, time.time()))
+        except sqlite3.Error as e:
+            _log("Eroare DB (save)", e)
+        return
+    now = time.time()
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("INSERT INTO history VALUES (?, ?, ?, ?)", (session_id, role, content, time.time()))
-        conn.commit()
-        conn.close()
+        SB.table("gym_history").insert(
+            {"session_id": session_id, "role": role, "content": content, "created_at": now}
+        ).execute()
+        SB.table("gym_sessions").update({"last_active": now}).eq("session_id", session_id).execute()
+        if role == "user":
+            SB.table("gym_sessions").update({"title": content.strip()[:60]}) \
+                .eq("session_id", session_id).is_("title", "null").execute()
     except Exception as e:
-        print(f"Eroare DB: {e}")
+        _log("Eroare DB (save)", e)
+
 
 def load_history_from_db(session_id):
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT role, content FROM history WHERE session_id=? ORDER BY timestamp ASC", (session_id,))
-        data = c.fetchall()
-        conn.close()
-        return [{"role": row[0], "content": row[1]} for row in data]
-    except:
+        if not ACCOUNTS_ENABLED:
+            with closing(_sqlite()) as conn:
+                rows = conn.execute(
+                    "SELECT role, content FROM history WHERE session_id=? ORDER BY timestamp ASC",
+                    (session_id,),
+                ).fetchall()
+            pairs = rows
+        else:
+            res = SB.table("gym_history").select("role, content, created_at") \
+                .eq("session_id", session_id).order("created_at").execute()
+            pairs = [(r["role"], r["content"]) for r in res.data or []]
+        return [{"role": role, "content": content} for role, content in pairs if content and content.strip()]
+    except Exception as e:
+        _log("Eroare DB (load)", e)
         return []
 
+
 def clear_history_db(session_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("DELETE FROM history WHERE session_id=?", (session_id,))
-    conn.commit()
-    conn.close()
+    try:
+        if not ACCOUNTS_ENABLED:
+            with closing(_sqlite()) as conn, conn:
+                conn.execute("DELETE FROM history WHERE session_id=?", (session_id,))
+        else:
+            SB.table("gym_history").delete().eq("session_id", session_id).execute()
+            SB.table("gym_sessions").update({"title": None}).eq("session_id", session_id).execute()
+    except Exception as e:
+        _log("Eroare DB (clear)", e)
 
-init_db()
 
-if "session_id" not in st.query_params:
-    new_id = str(uuid.uuid4())
-    st.query_params["session_id"] = new_id 
-    st.session_state.session_id = new_id
-else:
-    st.session_state.session_id = st.query_params["session_id"]
+def list_user_sessions(user_id, limit=15):
+    if not ACCOUNTS_ENABLED or not user_id:
+        return []
+    try:
+        res = SB.table("gym_sessions").select("session_id, title, last_active") \
+            .eq("user_id", user_id).order("last_active", desc=True).limit(limit).execute()
+        return res.data or []
+    except Exception as e:
+        _log("Lista conversațiilor eșuată", e)
+        return []
+
 
 # ==========================================
-# 3. ROTIRE API (CODUL TĂU ORIGINAL)
+# 3. AUTENTIFICARE OPȚIONALĂ (portată din Profesor ETTI)
 # ==========================================
+# Fără cont: aplicația merge ca înainte (conversația stă în acest browser).
+# Cu cont: conversațiile sunt legate de cont (gym_sessions.user_id) și apar pe orice dispozitiv.
+# „Ține-mă minte”: token aleator în localStorage; în DB doar sha256(token). Parolele: scrypt (stdlib).
+AUTH_TOKEN_DAYS = 180
+AUTH_MIN_PASSWORD = 8
+AUTH_MAX_FAILS = 5            # încercări greșite per email ...
+AUTH_FAIL_WINDOW = 600        # ... în 10 minute
+RESET_CODE_MINUTES = 15
+RESET_MAX_ATTEMPTS = 5
+RESET_EMAIL_COOLDOWN = 60     # secunde între două emailuri către aceeași adresă
+_RECOVERY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # fără 0/O, 1/I
+_EMAIL_RE = re.compile(r"^[^@\s:<>,;]{1,64}@[^@\s:<>,;]{1,255}\.[a-zA-Z]{2,24}$")
+DB_DOWN = "Baza de date nu e disponibilă acum. Încearcă mai târziu."
 
-raw_keys = None
-if "GOOGLE_API_KEYS" in st.secrets:
-    raw_keys = st.secrets["GOOGLE_API_KEYS"]
-elif "GOOGLE_API_KEY" in st.secrets:
-    raw_keys = [st.secrets["GOOGLE_API_KEY"]]
-else:
-    # Fallback pentru input manual în sidebar dacă nu există secrets
-    pass
 
-# Parsare chei (Exact logica ta)
-keys = []
-if raw_keys:
-    if isinstance(raw_keys, str):
+def _normalize_email(email):
+    """Litere mici, fără spații, fără „mailto:”, <> sau ?… (apar când emailul e copiat dintr-un link)."""
+    e = (email or "").strip().strip("<>").strip()
+    e = re.sub(r"^mailto:", "", e, flags=re.IGNORECASE)
+    return e.split("?")[0].strip().lower()
+
+
+def current_user():
+    return st.session_state.get("_auth_user")
+
+
+def current_user_id():
+    u = current_user()
+    return u.get("id") if u else None
+
+
+def _hash_password(password):
+    salt = secrets.token_bytes(16)
+    n, r, p = 2 ** 14, 8, 1
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
+    return f"scrypt${n}${r}${p}${salt.hex()}${dk.hex()}"
+
+
+def _verify_password(password, stored):
+    try:
+        algo, n, r, p, salt_hex, dk_hex = stored.split("$")
+        if algo != "scrypt":
+            return False
+        dk = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt_hex),
+                            n=int(n), r=int(r), p=int(p), dklen=len(dk_hex) // 2)
+        return hmac.compare_digest(dk.hex(), dk_hex)
+    except Exception:
+        return False
+
+
+def _token_hash(raw):
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@st.cache_resource
+def _get_auth_fail_store():
+    return {"lock": threading.Lock(), "fails": defaultdict(list)}
+
+
+def _auth_blocked(email):
+    store = _get_auth_fail_store()
+    with store["lock"]:
+        recent = [t for t in store["fails"][email] if t > time.time() - AUTH_FAIL_WINDOW]
+        store["fails"][email] = recent
+        return len(recent) >= AUTH_MAX_FAILS
+
+
+def _auth_note_fail(email):
+    store = _get_auth_fail_store()
+    with store["lock"]:
+        store["fails"][email].append(time.time())
+
+
+def _public_user(row):
+    return {"id": row["id"], "email": row["email"],
+            "name": row.get("display_name") or row["email"].split("@")[0]}
+
+
+def _new_recovery_code():
+    raw = "".join(secrets.choice(_RECOVERY_ALPHABET) for _ in range(12))
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+
+def _normalize_recovery(code):
+    return re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+
+
+def _reset_code_hash(user_id, code):
+    return hashlib.sha256(f"{user_id}:{code}".encode("utf-8")).hexdigest()
+
+
+def auth_register(email, password, display_name=""):
+    email = _normalize_email(email)
+    if not _EMAIL_RE.match(email):
+        return None, "Adresa de email nu pare validă."
+    if len(password or "") < AUTH_MIN_PASSWORD:
+        return None, f"Parola trebuie să aibă cel puțin {AUTH_MIN_PASSWORD} caractere."
+    if not ACCOUNTS_ENABLED:
+        return None, DB_DOWN
+    try:
+        if SB.table("gym_users").select("id").eq("email", email).limit(1).execute().data:
+            return None, "Există deja un cont cu acest email. Folosește „Intră”."
+        now = time.time()
+        rec = _new_recovery_code()
+        res = SB.table("gym_users").insert({
+            "email": email,
+            "password_hash": _hash_password(password),
+            "recovery_hash": _hash_password(_normalize_recovery(rec)),
+            "display_name": (display_name or "").strip()[:60] or None,
+            "created_at": now,
+            "last_login": now,
+        }).execute()
+        st.session_state["_auth_new_recovery"] = rec     # afișat o singură dată după creare
+        return _public_user(res.data[0]), ""
+    except Exception as e:
+        _log("Înregistrare cont eșuată", e)
+        return None, "Contul nu a putut fi creat. Încearcă din nou."
+
+
+def auth_login(email, password):
+    email = _normalize_email(email)
+    if _auth_blocked(email):
+        return None, "Prea multe încercări greșite. Așteaptă 10 minute."
+    if not ACCOUNTS_ENABLED:
+        return None, DB_DOWN
+    try:
+        res = SB.table("gym_users").select("id, email, display_name, password_hash") \
+            .eq("email", email).limit(1).execute()
+    except Exception as e:
+        _log("Autentificare: eroare DB", e)
+        return None, "Autentificarea nu a mers acum. Încearcă din nou."
+    row = res.data[0] if res.data else None
+    if not row or not _verify_password(password or "", row["password_hash"]):
+        _auth_note_fail(email)
+        return None, "Email sau parolă greșită."
+    try:
+        SB.table("gym_users").update({"last_login": time.time()}).eq("id", row["id"]).execute()
+    except Exception:
+        pass
+    return _public_user(row), ""
+
+
+def _smtp_config():
+    try:
+        user = st.secrets.get("SMTP_USER", "")
+        pw = st.secrets.get("SMTP_PASSWORD", "")
+        if not user or not pw:
+            return None
+        return {"user": user, "password": str(pw).replace(" ", ""),
+                "host": st.secrets.get("SMTP_HOST", "smtp.gmail.com"),
+                "port": int(st.secrets.get("SMTP_PORT", 465)),
+                "sender": st.secrets.get("SMTP_FROM_NAME", APP_NAME)}
+    except Exception:
+        return None
+
+
+def _send_email(to, subject, body):
+    cfg = _smtp_config()
+    if not cfg:
+        return False
+    msg = EmailMessage()
+    msg["From"] = f"{cfg['sender']} <{cfg['user']}>"
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20) as srv:
+            srv.login(cfg["user"], cfg["password"])
+            srv.send_message(msg)
+        return True
+    except Exception as e:
+        _log("Trimiterea emailului a eșuat", e)
+        return False
+
+
+@st.cache_resource
+def _get_reset_mail_store():
+    return {"lock": threading.Lock(), "last": {}}
+
+
+def auth_request_reset_email(email):
+    """Cod de 6 cifre pe email. Același mesaj dacă emailul există sau nu."""
+    email = _normalize_email(email)
+    if not _EMAIL_RE.match(email):
+        return False, "Adresa de email nu pare validă."
+    if not _smtp_config():
+        return False, "Trimiterea de emailuri nu e configurată. Folosește codul de recuperare."
+    store = _get_reset_mail_store()
+    with store["lock"]:
+        if time.time() - store["last"].get(email, 0) < RESET_EMAIL_COOLDOWN:
+            return False, "Ți-am trimis deja un cod. Verifică emailul (și Spam) sau încearcă peste un minut."
+        store["last"][email] = time.time()
+    generic = (f"Dacă există un cont cu {email}, am trimis un cod de 6 cifre (valabil "
+               f"{RESET_CODE_MINUTES} minute). Verifică și folderul Spam.")
+    if not ACCOUNTS_ENABLED:
+        return False, DB_DOWN
+    try:
+        res = SB.table("gym_users").select("id").eq("email", email).limit(1).execute()
+        if not res.data:
+            return True, generic
+        uid = res.data[0]["id"]
+        code = f"{secrets.randbelow(10 ** 6):06d}"
+        now = time.time()
+        SB.table("gym_password_resets").upsert({
+            "user_id": uid, "code_hash": _reset_code_hash(uid, code),
+            "expires_at": now + RESET_CODE_MINUTES * 60, "attempts": 0, "created_at": now,
+        }).execute()
+    except Exception as e:
+        _log("Cerere resetare parolă: eroare DB", e)
+        return False, "Nu am putut genera codul acum. Încearcă din nou."
+    body = (f"Salut!\n\nCodul tău pentru resetarea parolei în {APP_NAME} este:\n\n    {code}\n\n"
+            f"Codul e valabil {RESET_CODE_MINUTES} minute. Dacă nu ai cerut tu resetarea, "
+            "ignoră acest email: parola ta rămâne neschimbată.\n")
+    if not _send_email(email, f"Codul tău {APP_NAME}: {code}", body):
+        return False, "Emailul nu a putut fi trimis acum. Încearcă din nou sau folosește codul de recuperare."
+    return True, generic
+
+
+def auth_reset_password(email, code, new_password):
+    """Parolă nouă cu codul din email (6 cifre) SAU codul de recuperare. Deconectează toate dispozitivele."""
+    email = _normalize_email(email)
+    code = (code or "").strip()
+    if len(new_password or "") < AUTH_MIN_PASSWORD:
+        return None, f"Parola nouă trebuie să aibă cel puțin {AUTH_MIN_PASSWORD} caractere."
+    if _auth_blocked(email):
+        return None, "Prea multe încercări greșite. Așteaptă 10 minute."
+    if not ACCOUNTS_ENABLED:
+        return None, DB_DOWN
+    bad = "Email sau cod greșit (ori codul a expirat)."
+    try:
+        res = SB.table("gym_users").select("id, email, display_name, recovery_hash") \
+            .eq("email", email).limit(1).execute()
+        row = res.data[0] if res.data else None
+        if not row:
+            _auth_note_fail(email)
+            return None, bad
+        uid = row["id"]
+        used_recovery = False
+        if re.fullmatch(r"\d{6}", code):
+            r = SB.table("gym_password_resets").select("code_hash, expires_at, attempts") \
+                .eq("user_id", uid).limit(1).execute()
+            rr = r.data[0] if r.data else None
+            if (not rr or rr["expires_at"] < time.time() or rr["attempts"] >= RESET_MAX_ATTEMPTS
+                    or not hmac.compare_digest(rr["code_hash"], _reset_code_hash(uid, code))):
+                if rr:
+                    SB.table("gym_password_resets").update({"attempts": rr["attempts"] + 1}) \
+                        .eq("user_id", uid).execute()
+                _auth_note_fail(email)
+                return None, bad
+        else:
+            if not row.get("recovery_hash") or not _verify_password(_normalize_recovery(code), row["recovery_hash"]):
+                _auth_note_fail(email)
+                return None, bad
+            used_recovery = True
+        update = {"password_hash": _hash_password(new_password), "last_login": time.time()}
+        new_rec = None
+        if used_recovery:
+            new_rec = _new_recovery_code()          # codul de recuperare e de unică folosință
+            update["recovery_hash"] = _hash_password(_normalize_recovery(new_rec))
+        SB.table("gym_users").update(update).eq("id", uid).execute()
+        SB.table("gym_password_resets").delete().eq("user_id", uid).execute()
+        SB.table("gym_tokens").delete().eq("user_id", uid).execute()      # deconectăm peste tot
+        if new_rec:
+            st.session_state["_auth_new_recovery"] = new_rec
+        return _public_user(row), ""
+    except Exception as e:
+        _log("Resetare parolă eșuată", e)
+        return None, "Parola nu a putut fi schimbată acum. Încearcă din nou."
+
+
+def auth_regenerate_recovery():
+    uid = current_user_id()
+    if not uid or not ACCOUNTS_ENABLED:
+        return False
+    rec = _new_recovery_code()
+    try:
+        SB.table("gym_users").update({"recovery_hash": _hash_password(_normalize_recovery(rec))}) \
+            .eq("id", uid).execute()
+        st.session_state["_auth_new_recovery"] = rec
+        return True
+    except Exception as e:
+        _log("Cod de recuperare nou eșuat", e)
+        return False
+
+
+def _dismiss_recovery():
+    st.session_state.pop("_auth_new_recovery", None)
+
+
+def _issue_remember_token(user_id):
+    raw = secrets.token_urlsafe(32)
+    now = time.time()
+    try:
+        SB.table("gym_tokens").insert({
+            "token_hash": _token_hash(raw), "user_id": user_id, "created_at": now,
+            "expires_at": now + AUTH_TOKEN_DAYS * 86400, "last_used": now,
+        }).execute()
+        return raw
+    except Exception as e:
+        _log("Token „ține-mă minte” nu a putut fi creat", e)
+        return None
+
+
+def _user_from_token(raw):
+    """Utilizatorul pentru token (și prelungește valabilitatea), sau None."""
+    if not ACCOUNTS_ENABLED or not raw or not isinstance(raw, str) or len(raw) > 200:
+        return None
+    try:
+        th = _token_hash(raw)
+        res = SB.table("gym_tokens").select("user_id, expires_at").eq("token_hash", th).limit(1).execute()
+        if not res.data or res.data[0]["expires_at"] < time.time():
+            return None
+        u = SB.table("gym_users").select("id, email, display_name") \
+            .eq("id", res.data[0]["user_id"]).limit(1).execute()
+        if not u.data:
+            return None
+        now = time.time()
+        SB.table("gym_tokens").update({"last_used": now, "expires_at": now + AUTH_TOKEN_DAYS * 86400}) \
+            .eq("token_hash", th).execute()
+        SB.table("gym_users").update({"last_login": now}).eq("id", u.data[0]["id"]).execute()
+        return _public_user(u.data[0])
+    except Exception as e:
+        _log("Restaurare login din token eșuată", e)
+        return None
+
+
+def _set_browser_token(raw):
+    """Programează scrierea/ștergerea tokenului în localStorage (vezi sync_browser_storage)."""
+    st.session_state["_auth_ls_js"] = (
+        f"localStorage.setItem('gymbro_auth_token', {json.dumps(raw)});" if raw
+        else "localStorage.removeItem('gymbro_auth_token');"
+    )
+    st.session_state["_auth_raw_token"] = raw
+
+
+def switch_session(new_sid):
+    st.session_state.session_id = new_sid
+    st.session_state.pop("messages", None)
+    st.session_state.pop("media", None)
+    st.session_state["uploader_key"] = st.session_state.get("uploader_key", 0) + 1
+    st.query_params["session_id"] = new_sid
+
+
+def new_session():
+    sid = str(uuid.uuid4())
+    session_register(sid, current_user_id())
+    switch_session(sid)
+
+
+def auth_complete_login(user, remember):
+    st.session_state["_auth_user"] = user
+    # Conversația anonimă curentă din acest browser trece în cont
+    sid = st.session_state.get("session_id")
+    if ACCOUNTS_ENABLED and sid:
         try:
-            raw_keys = ast.literal_eval(raw_keys)
-        except:
-            raw_keys = [raw_keys]
-    if isinstance(raw_keys, list):
-        for k in raw_keys:
-            if k and isinstance(k, str):
-                clean_k = k.strip().strip('"').strip("'")
-                if clean_k:
-                    keys.append(clean_k)
+            SB.table("gym_sessions").update({"user_id": user["id"]}) \
+                .eq("session_id", sid).is_("user_id", "null").execute()
+        except Exception as e:
+            _log("Atașarea conversației la cont a eșuat", e)
+    _set_browser_token(_issue_remember_token(user["id"]) if remember else None)
 
-# Dacă nu găsim chei în secrets, cerem manual (pentru siguranță)
+
+def auth_logout(all_devices=False):
+    user = current_user()
+    raw = st.session_state.get("_auth_raw_token") or (st.session_state.get("_browser_storage") or {}).get("token")
+    try:
+        if user and all_devices:
+            SB.table("gym_tokens").delete().eq("user_id", user["id"]).execute()
+        elif raw:
+            SB.table("gym_tokens").delete().eq("token_hash", _token_hash(raw)).execute()
+    except Exception as e:
+        _log("Ștergere token la deconectare eșuată", e)
+    st.session_state.pop("_auth_user", None)
+    if isinstance(st.session_state.get("_browser_storage"), dict):
+        st.session_state["_browser_storage"]["token"] = ""
+    _set_browser_token(None)
+    # Conversația curentă aparține contului: pe acest browser pornim una nouă, anonimă
+    new_session()
+
+
+def load_browser_storage_and_login():
+    """O dată per sesiune Streamlit: citește din browser SID-ul și tokenul (session_bridge),
+    apoi restaurează automat contul din token."""
+    if "_browser_storage" not in st.session_state:
+        val = _session_bridge(key="_session_bridge", default=None) if _session_bridge is not None else {}
+        if val is None:
+            st.markdown(
+                '<div style="display:flex;align-items:center;justify-content:center;'
+                'min-height:40vh;color:#888;font-size:15px;">💪 Se încarcă...</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Dacă pagina rămâne aici mai mult de câteva secunde, apasă mai jos.")
+            if st.button("🔄 Continuă", key="_session_gate_manual_continue"):
+                st.session_state["_browser_storage"] = {}
+                st.rerun()
+            st.stop()
+        st.session_state["_browser_storage"] = val if isinstance(val, dict) else {}
+    if not st.session_state.get("_auth_restore_done"):
+        st.session_state["_auth_restore_done"] = True
+        raw = (st.session_state["_browser_storage"] or {}).get("token") or ""
+        if raw and not current_user() and ACCOUNTS_ENABLED:
+            user = _user_from_token(raw)
+            if user:
+                st.session_state["_auth_user"] = user
+                st.session_state["_auth_raw_token"] = raw
+            else:
+                _set_browser_token(None)        # token expirat/revocat → îl scoatem din browser
+
+
+def resolve_session():
+    """Alege conversația: ?session_id= din URL, apoi cea salvată în browser, altfel una nouă.
+    O conversație care aparține ALTUI cont nu se deschide (link-ul nu mai e suficient)."""
+    if "session_id" in st.session_state:
+        st.query_params["session_id"] = st.session_state.session_id
+        return
+    storage = st.session_state.get("_browser_storage") or {}
+    candidate = st.query_params.get("session_id") or storage.get("sid") or ""
+    sid = candidate if is_valid_uuid(candidate) else str(uuid.uuid4())
+    exists, owner = session_owner(sid)
+    if exists and owner and owner != current_user_id():
+        sid, exists = str(uuid.uuid4()), False
+    if not exists:
+        session_register(sid, current_user_id())
+    st.session_state.session_id = sid
+    st.query_params["session_id"] = sid
+
+
+def sync_browser_storage():
+    """Scrie în localStorage SID-ul curent și (o singură dată) tokenul. Conținut identic la rerun =
+    iframe-ul nu se re-execută."""
+    js = f"localStorage.setItem('gymbro_session_id', {json.dumps(st.session_state.session_id)});"
+    js += st.session_state.get("_auth_ls_js") or ""
+    components.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+
+
+load_browser_storage_and_login()
+resolve_session()
+
+# ==========================================
+# 4. CHEI API & LANȚ DE MODELE (rotație chei × modele, ca în Profesor ETTI)
+# ==========================================
+
+
+def parse_secret_list(raw):
+    """Acceptă listă TOML, string cu listă Python sau un singur string."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            raw = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            raw = [raw]
+    if isinstance(raw, str):
+        raw = [raw]
+    result = []
+    for item in raw:
+        if item and isinstance(item, str):
+            clean = item.strip().strip('"').strip("'")
+            if clean and clean not in result:
+                result.append(clean)
+    return result
+
+
+keys = []
+if "GOOGLE_API_KEYS" in st.secrets:
+    keys = parse_secret_list(st.secrets["GOOGLE_API_KEYS"])
+elif "GOOGLE_API_KEY" in st.secrets:
+    keys = parse_secret_list(st.secrets["GOOGLE_API_KEY"])
+
+# Ordinea = cota zilnică mare întâi, apoi rezervele mici (cote per PROIECT Google și per model).
+# Se poate suprascrie din secrets cu GEMINI_MODELS = ["...", "..."].
+DEFAULT_MODEL_CHAIN = [
+    "gemini-3.1-flash-lite",    # 500 RPD
+    "gemini-3.5-flash-lite",    # 500 RPD
+    "gemini-3.6-flash",         # 20 RPD
+    "gemini-3-flash-preview",   # 20 RPD
+    "gemini-3.8-flash",         # 20 RPD
+    "gemini-2.5-flash",         # 20 RPD (gândire prin thinking_budget)
+    "gemini-2.5-flash-lite",    # 20 RPD
+]
+MODEL_CHAIN = (parse_secret_list(st.secrets.get("GEMINI_MODELS")) if "GEMINI_MODELS" in st.secrets else []) \
+    or list(DEFAULT_MODEL_CHAIN)
+
+# Dacă nu găsim chei în secrets, cerem manual
 if not keys:
     with st.sidebar:
-        k = st.text_input("API Key (Manual):", type="password")
-        if k: keys.append(k)
+        manual_key = st.text_input("API Key (Manual):", type="password")
+        if manual_key and manual_key.strip():
+            keys.append(manual_key.strip())
 
-if not keys:
-    st.error("❌ Nu am găsit nicio cheie API validă. Adaugă 'GOOGLE_API_KEYS' în secrets sau introdu una manual.")
-    st.stop()
-
-if "key_index" not in st.session_state:
+if "key_index" not in st.session_state or st.session_state.key_index >= max(len(keys), 1):
     st.session_state.key_index = 0
+
+
+@st.cache_resource(show_spinner=False)
+def get_client(api_key):
+    # Un client separat pe cheie (fără configurare globală): utilizatorii simultani nu se încurcă.
+    return genai.Client(api_key=api_key)
+
+
+# --- Memorie COMUNĂ (pentru toți utilizatorii, cât trăiește serverul) a combinațiilor epuizate ---
+#   limită pe zi → ocolită până la resetare (miezul nopții Pacific ≈ 10:00 ora României)
+#   limită pe minut → retryDelay (5 s – 5 min); supraîncărcare → 30 s
+#   model inexistent (404) → 6 ore pe toate cheile; cheie invalidă → 1 oră pe toate modelele
+@st.cache_resource
+def _get_quota_state():
+    return {"lock": threading.Lock(), "blocked": {}}   # (amprentă_cheie | "*", model | "*") -> până_la
+
+
+def _key_fp(api_key):
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def _next_quota_reset():
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+        return (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0).timestamp()
+    except Exception:
+        return (datetime.now(timezone.utc) + timedelta(hours=24)).timestamp()
+
+
+def _quota_block(api_key, model, until):
+    state = _get_quota_state()
+    k = (_key_fp(api_key) if api_key else "*", model or "*")
+    with state["lock"]:
+        state["blocked"][k] = max(until, state["blocked"].get(k, 0))
+
+
+def _quota_blocked_until(api_key, model):
+    state = _get_quota_state()
+    now = time.time()
+    fp = _key_fp(api_key)
+    with state["lock"]:
+        b = state["blocked"]
+        for k in [k for k, v in b.items() if v <= now]:
+            del b[k]
+        return max(b.get((fp, model), 0), b.get((fp, "*"), 0), b.get(("*", model), 0))
+
+
+def _quota_until_from_error(msg):
+    low = msg.lower()
+    if "perday" in low or "per_day" in low or "per day" in low or "requests_per_day" in low or "rpd" in low:
+        return _next_quota_reset()
+    m = re.search(r"retry(?:_delay|delay)?[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)\s*s", low)
+    wait = float(m.group(1)) if m else 60.0
+    return time.time() + min(max(wait, 5.0), 300.0)
+
+
+def _pick_key_and_model():
+    """Prima combinație liberă: cheia curentă întâi (toate modelele), apoi celelalte chei."""
+    n = len(keys)
+    start = st.session_state.get("key_index", 0) % max(n, 1)
+    for off in range(n):
+        ki = (start + off) % n
+        for mi, m in enumerate(MODEL_CHAIN):
+            if _quota_blocked_until(keys[ki], m) <= time.time():
+                return ki, mi
+    return None
+
+
+def _thinking_config_for(model_name):
+    """Gemini 3.x: thinking_level; Gemini 2.5: thinking_budget (nu acceptă thinking_level)."""
+    if model_name.startswith("gemini-2.5"):
+        return types.ThinkingConfig(thinking_budget=0)
+    return types.ThinkingConfig(thinking_level="low")
+
 
 # --- PROMPT-UL SISTEMULUI (Optimizat pentru adolescenți) ---
 SYSTEM_PROMPT = """
 Ești un Antrenor Personal Virtual și Nutriționist numit "GymBro AI", specializat în lucrul cu adolescenții.
 
-REGULI DE IDENTITATE (STRICT):
-    1. Folosește EXCLUSIV genul masculin când vorbești despre tine.
-       - Corect: "Sunt sigur", "Sunt pregătit", "Am fost atent", "Sunt bucuros".
-       - GREȘIT: "Sunt sigură", "Sunt pregătită".
-    2. Te prezinți ca "Antrenor Personal" sau "Antrenor tău Personal virtual".
-    
-STIL:
-- Prietenos, motivațional, clar, "cool" dar responsabil.
-- Folosește emoji-uri 💪🥗🔥.
-- Vorbește la persoana I singular ("Eu cred", "Te ajut").
-- Adresează-te utilizatorului direct ("Tu trebuie să faci").
+IDENTITATE:
+1. Folosește EXCLUSIV genul masculin când vorbești despre tine.
+   - Corect: "Sunt sigur", "Sunt pregătit", "Am fost atent", "Sunt bucuros".
+   - GREȘIT: "Sunt sigură", "Sunt pregătită".
+2. Te prezinți ca "Antrenorul tău personal virtual".
 
-TON ȘI ADRESARE (CRITIC):
-    3. Vorbește DIRECT, la persoana I singular.
-       - CORECT: "Salut, sunt aici să te ajut." / "Te ascult." / "Sunt pregătit."
-       - GREȘIT: "Domnul Antrenor este aici." / "Antrenorul te va ajuta."
-    4. Fii cald, natural, apropiat și scurt. Evită introducerile pompoase.
-    5. NU SALUTA în fiecare mesaj. Salută DOAR la începutul unei conversații noi.
+TON ȘI ADRESARE:
+3. Vorbește DIRECT, la persoana I singular ("Eu cred", "Te ajut", "Sunt pregătit").
+   - GREȘIT: "Domnul Antrenor este aici." / "Antrenorul te va ajuta."
+4. Adresează-te utilizatorului direct, la persoana a II-a ("Tu trebuie să faci").
+5. Prietenos, motivațional, clar, "cool" dar responsabil. Folosește emoji-uri 💪🥗🔥 cu măsură.
+6. Fii cald, natural și scurt. Evită introducerile pompoase.
+7. NU SALUTA în fiecare mesaj. Salută DOAR la începutul unei conversații noi.
 
 REGULI DE AUR:
-1. Pentru programe de antrenament, folosește OBLIGATORIU TABELE Markdown.
-2. (CRITIC) Nu recomanda NICIODATĂ suplimente de creatina sau steroizi
-3. Dacă utilizatorul e începător, pune accent pe formă corectă.
-4. Nutriție: Focus pe mâncare reală, cu exemplificari si recomandari. Alimentatia trebuie sa fie doar naturala.
+1. Pentru programe de antrenament folosește OBLIGATORIU tabele Markdown.
+2. (CRITIC) Nu recomanda NICIODATĂ suplimente: creatină, steroizi, proteine pudră, pre-workout,
+   "fat burners", băuturi energizante sau orice altă pastilă/pulbere. Doar mâncare reală.
+3. Dacă utilizatorul e începător, insistă pe forma corectă, nu pe greutăți mari.
+4. Nutriție: mâncare reală, naturală și variată, cu exemple concrete de mese și gustări.
+
+SIGURANȚĂ (CRITIC, utilizatorii sunt adolescenți):
+1. Progresia este treptată. Pentru cei mai mici de 16 ani recomandă în primul rând exerciții cu greutatea
+   corpului, iar la greutăți libere spune-le să lucreze sub supravegherea unui antrenor sau a unui adult.
+2. Fără diete restrictive, fără deficit caloric mare, fără post, fără numărat obsesiv de calorii
+   sau cântărit zilnic. Nu da ținte de greutate corporală.
+3. Dacă utilizatorul pomenește durere, o accidentare, amețeli, leșin, probleme cu inima sau o boală,
+   spune-i să oprească efortul și să meargă la medic sau kinetoterapeut și să anunțe un părinte.
+   Nu pune diagnostice.
+4. Dacă observi semne de relație nesănătoasă cu mâncarea sau cu propriul corp (vrea să slăbească extrem
+   de repede, sare peste mese, vomită după masă, face sport ca să "ardă" ce a mâncat, se urăște pentru
+   cum arată), răspunde cu căldură, fără planuri de slăbit, încurajează-l să vorbească cu un părinte,
+   un medic sau consilierul școlar și menționează Telefonul Copilului: 116 111 (gratuit).
 
 OBIECTIVELE TALE:
 1. Să creezi planuri de antrenament organizate pe ZILE și SĂPTĂMÂNI.
 2. Să explici corect execuția exercițiilor pentru a evita accidentările.
-3. Să oferi sfaturi nutriționale sănătoase (fără diete extreme, focus pe proteine și energie).
+3. Să oferi sfaturi nutriționale sănătoase (fără diete extreme, focus pe proteine și energie din mâncare).
 4. Să răspunzi la întrebări despre sală sau exerciții acasă.
-5. Să fii realist si sa nu fii ca influencerii de fitness.
-
-IMPORTANT: Dacă utilizatorul este începător, insistă pe forma corectă, nu pe greutăți mari.
+5. Să fii realist și să nu fii ca influencerii de fitness.
 """
 
-# Configurare Filtre
-safety_settings = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+# Filtre de siguranță: aplicația e pentru adolescenți, deci NU le dezactivăm
+SAFETY_SETTINGS = [
+    types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE)
+    for category in (
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    )
 ]
 
-# --- FUNCȚIE GENERATOR CU ROTIRE (CODUL TĂU ORIGINAL) ---
-def run_chat_with_rotation(history_obj, payload):
-    max_retries = len(keys) * 2
-    for attempt in range(max_retries):
+
+class EmptyResponseError(Exception):
+    """Modelul n-a întors niciun text (de obicei răspuns blocat de filtre)."""
+
+
+class FatalRequestError(Exception):
+    """Eroare care nu se rezolvă schimbând cheia sau modelul."""
+
+
+def get_media_part(client, key_idx):
+    """Materialul atașat, în forma potrivită pentru cheia dată (sau None)."""
+    media = st.session_state.get("media")
+    if not media:
+        return None
+    if media["kind"] == "image":
+        return types.Part.from_bytes(data=media["data"], mime_type=media["mime"])
+
+    # PDF: fișierele urcate aparțin proiectului cheii → îl urcăm o dată pe fiecare cheie folosită
+    cached = media["files"].get(key_idx)
+    if cached and time.time() - cached["uploaded_at"] < FILE_MAX_AGE_SECONDS:
+        return types.Part.from_uri(file_uri=cached["file"].uri, mime_type="application/pdf")
+    uploaded = client.files.upload(
+        file=BytesIO(media["data"]),
+        config=types.UploadFileConfig(mime_type="application/pdf", display_name=media["name"]),
+    )
+    deadline = time.time() + 120
+    while uploaded.state == types.FileState.PROCESSING:
+        if time.time() > deadline:
+            raise FatalRequestError("Procesarea PDF-ului durează prea mult. Încearcă un fișier mai mic.")
+        time.sleep(1)
+        uploaded = client.files.get(name=uploaded.name)
+    if uploaded.state == types.FileState.FAILED:
+        raise FatalRequestError("Gemini nu a putut procesa PDF-ul.")
+    media["files"][key_idx] = {"file": uploaded, "uploaded_at": time.time()}
+    return types.Part.from_uri(file_uri=uploaded.uri, mime_type="application/pdf")
+
+
+def _error_text(e):
+    details = getattr(e, "details", None)
+    try:
+        details = json.dumps(details, ensure_ascii=False)
+    except (TypeError, ValueError):
+        details = str(details)
+    return f"{e} {details}"
+
+
+def run_chat_with_rotation(history, user_text):
+    """Generează răspunsul în stream. La fiecare încercare alege prima combinație (cheie, model)
+    neepuizată; o eroare de cotă o marchează și trece imediat la următoarea."""
+    if not keys:
+        raise FatalRequestError("Nicio cheie API Gemini configurată.")
+    deadline = time.time() + 60
+    last_kind = None
+
+    for _ in range(len(keys) * len(MODEL_CHAIN) + 6):
+        pick = _pick_key_and_model()
+        if pick is None:
+            if last_kind == "overload":
+                raise FatalRequestError("Serviciul AI e supraîncărcat. Încearcă din nou în câteva secunde. 🐢")
+            raise FatalRequestError(
+                "Toate cheile API sunt epuizate sau invalide pentru azi. "
+                "Cotele se resetează în jurul orei 10:00 (ora României). 🔑"
+            )
+        key_idx, model_idx = pick
+        if key_idx != st.session_state.key_index:
+            st.session_state.key_index = key_idx
+            st.toast(f"🔄 Trec pe cheia {key_idx + 1}/{len(keys)}...", icon="🔑")
+        api_key = keys[key_idx]
+        model_name = MODEL_CHAIN[model_idx]
+        client = get_client(api_key)
+        started = False
         try:
-            if st.session_state.key_index >= len(keys):
-                 st.session_state.key_index = 0
-            current_key = keys[st.session_state.key_index]
-            genai.configure(api_key=current_key)
-            
-            # AICI AM SCHIMBAT DOAR NUMELE MODELULUI DIN '2.5' IN '1.5' CA SA NU DEA EROARE 404
-            model = genai.GenerativeModel("gemini-2.5-flash", system_instruction=SYSTEM_PROMPT, safety_settings=safety_settings)
-            
-            chat = model.start_chat(history=history_obj)
-            response_stream = chat.send_message(payload, stream=True)
-            for chunk in response_stream:
-                try:
-                    if chunk.text: yield chunk.text
-                except ValueError: continue
-            return 
+            parts = []
+            media_part = get_media_part(client, key_idx)
+            if media_part is not None:
+                parts.append(media_part)
+            parts.append(types.Part(text=user_text))
+            contents = history + [types.UserContent(parts=parts)]
+            config = types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                safety_settings=SAFETY_SETTINGS,
+                thinking_config=_thinking_config_for(model_name),
+            )
+            for chunk in client.models.generate_content_stream(model=model_name, contents=contents, config=config):
+                text = chunk.text
+                if text:
+                    started = True
+                    yield text
+            if not started:
+                raise EmptyResponseError()
+            if model_idx > 0:
+                st.toast(f"ℹ️ Răspuns generat cu modelul de rezervă ({model_name})", icon="🔄")
+            return
+
+        except (EmptyResponseError, FatalRequestError):
+            raise
         except Exception as e:
-            error_msg = str(e)
-            # Logica ta originală de erori
-            if "503" in error_msg or "overloaded" in error_msg:
-                st.toast("🐢 Reîncerc...", icon="⏳")
-                time.sleep(2)
+            if started:
+                # Utilizatorul a primit deja o parte din răspuns: o reîncercare ar dubla textul
+                raise FatalRequestError("Răspunsul s-a întrerupt. Te rog trimite din nou mesajul.") from e
+            code = getattr(e, "code", None)
+            msg = _error_text(e)
+            low = msg.lower()
+            is_invalid_key = ("api key not valid" in low or "api_key_invalid" in low
+                              or "invalid api key" in low or code == 401)
+            is_quota = code == 429 or re.search(r"\b429\b", msg) is not None or "resource_exhausted" in low \
+                or "quota" in low
+            is_missing_model = code == 404 or (code is None and re.search(r"\b404\b", msg) is not None) \
+                or "is not supported for generatecontent" in low
+            is_overload = (code is not None and code >= 500) or "overloaded" in low or "unavailable" in low
+
+            if is_invalid_key or (code == 403 and "permission" in low and "file" not in low):
+                last_kind = "invalid"
+                _quota_block(api_key, None, time.time() + 3600)
+                _log(f"cheia {key_idx + 1} invalidă: ocolită 1 oră")
                 continue
-            elif "400" in error_msg or "429" in error_msg or "Quota" in error_msg or "API key not valid" in error_msg or "403" in error_msg:
-                st.toast(f"⚠️ Schimb cheia {st.session_state.key_index + 1}...", icon="🔄")
-                st.session_state.key_index = (st.session_state.key_index + 1) % len(keys)
+            if is_quota:
+                last_kind = "quota"
+                _quota_block(api_key, model_name, _quota_until_from_error(msg))
+                st.toast(f"⚠️ Limită atinsă pe {model_name}, încerc altă variantă...", icon="🔄")
                 continue
-            else:
-                # Erori neprevăzute (inclusiv dacă modelul nu există)
-                st.session_state.key_index = (st.session_state.key_index + 1) % len(keys)
+            if is_missing_model:
+                last_kind = "missing"
+                _quota_block(None, model_name, time.time() + 6 * 3600)
+                _log(f"modelul {model_name} nu e disponibil: scos din lanț 6 ore")
                 continue
-    raise Exception("Serviciul este indisponibil momentan. Toate cheile au fost încercate.")
+            if is_overload:
+                last_kind = "overload"
+                _quota_block(api_key, model_name, time.time() + 30)
+                if time.time() >= deadline:
+                    raise FatalRequestError("Serviciul AI e supraîncărcat. Încearcă din nou în câteva secunde. 🐢") from e
+                st.toast(f"🐢 {model_name} ocupat, încerc altă variantă...", icon="⏳")
+                time.sleep(0.5)
+                continue
+            if isinstance(e, errors.APIError):
+                # 400 și alte erori de cerere: altă cheie sau alt model nu ajută
+                raise FatalRequestError(f"Cerere respinsă de Gemini ({code}): {getattr(e, 'message', e)}") from e
+            # Erori de rețea etc.: încercăm altă combinație
+            last_kind = "overload"
+            _quota_block(api_key, model_name, time.time() + 30)
+            _log("eroare de rețea", e)
+            continue
+
+    raise FatalRequestError("Serviciul AI e momentan supraîncărcat. Încearcă din nou în câteva secunde. 🙏")
+
+
+def build_history(messages):
+    """Istoric valid pentru Gemini: fără mesaje goale, roluri alternante, începe cu 'user'.
+    Întoarce (istoric, text_user_rămas_fără_răspuns)."""
+    contents = []
+    for msg in messages:
+        text = (msg.get("content") or "").strip()
+        if not text:
+            continue
+        role = "model" if msg["role"] == "assistant" else "user"
+        if contents and contents[-1].role == role:
+            contents[-1].parts.append(types.Part(text=text))
+        else:
+            contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
+    while contents and contents[0].role != "user":
+        contents.pop(0)
+    # Ultimul mesaj al userului fără răspuns (eroare anterioară) se lipește de mesajul curent
+    pending = ""
+    if contents and contents[-1].role == "user":
+        pending = "\n\n".join(p.text for p in contents.pop().parts if p.text)
+    return contents, pending
+
 
 # ==========================================
-# 4. SIDEBAR & UPLOAD
+# 5. RANDARE MESAJE & AUDIO
 # ==========================================
+
+
+def render_svg(svg_code):
+    if "xmlns" not in svg_code[:200]:
+        svg_code = svg_code.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"', 1)
+    # Randat ca imagine: scripturile/handler-ele din SVG nu se execută într-un <img>
+    encoded = base64.b64encode(svg_code.encode("utf-8")).decode("ascii")
+    st.markdown(
+        f'<div class="svg-container"><img src="data:image/svg+xml;base64,{encoded}" alt="desen"/></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_message(content):
+    content = content.replace("[[DESEN_SVG]]", "").replace("[[/DESEN_SVG]]", "")
+    position = 0
+    for match in SVG_PATTERN.finditer(content):
+        text_before = content[position:match.start()]
+        if text_before.strip():
+            st.markdown(text_before)
+        render_svg(match.group(0))
+        position = match.end()
+    text_after = content[position:]
+    if text_after.strip():
+        st.markdown(text_after)
+
+
+def text_for_speech(content, limit=1000):
+    text = SVG_PATTERN.sub(" ", content)
+    text = text.replace("[[DESEN_SVG]]", "").replace("[[/DESEN_SVG]]", "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"^\s*\|?\s*:?-{3,}.*$", " ", text, flags=re.MULTILINE)  # separatori de tabel
+    text = text.replace("|", ", ")
+    text = re.sub(r"[*_#`>~]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        cut = text[:limit]
+        sentence_end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+        text = cut[:sentence_end + 1] if sentence_end > limit // 2 else cut[:cut.rfind(" ")]
+    return text
+
+
+def make_audio(content):
+    text = text_for_speech(content)
+    if not text:
+        return None
+    try:
+        sound_file = BytesIO()
+        gTTS(text=text, lang="ro").write_to_fp(sound_file)
+        return sound_file.getvalue()
+    except Exception as e:
+        _log("Eroare audio", e)
+        return None
+
+
+# ==========================================
+# 6. SIDEBAR: CONT, CONVERSAȚII, SETĂRI, UPLOAD
+# ==========================================
+
+
+def render_account_ui():
+    if not ACCOUNTS_ENABLED:
+        st.caption("👤 Conturile nu sunt disponibile acum (baza de date nu e configurată).")
+        return
+
+    rec = st.session_state.get("_auth_new_recovery")
+    if rec:
+        st.warning("🔑 **Codul tău de recuperare** (îl vezi o singură dată). Cu el îți poți schimba "
+                   "parola dacă o uiți. Notează-l sau descarcă-l.")
+        st.code(rec, language=None)
+        st.download_button("⬇️ Descarcă codul (.txt)", f"Cod de recuperare {APP_NAME}: {rec}\n",
+                           file_name="gymbro-cod-recuperare.txt", key="_auth_rec_download")
+        st.button("✅ Am notat codul", key="_auth_rec_dismiss", on_click=_dismiss_recovery)
+
+    user = current_user()
+    with st.expander(f"👤 {user['name']}" if user else "👤 Cont (opțional)", expanded=False):
+        if user:
+            st.caption(f"Conectat ca **{user['email']}**. Conversațiile tale apar pe orice dispozitiv.")
+            c1, c2 = st.columns(2)
+            if c1.button("🚪 Ieșire", key="_auth_logout"):
+                auth_logout(False)
+                st.rerun()
+            if c2.button("Ieșire peste tot", key="_auth_logout_all"):
+                auth_logout(True)
+                st.rerun()
+            if st.button("Generează cod nou", key="_auth_regen_recovery",
+                         help="Un cod de recuperare nou; cel vechi nu mai merge."):
+                if auth_regenerate_recovery():
+                    st.rerun()
+                st.error("Nu am putut genera codul acum.")
+            return
+
+        st.caption("Fără cont, conversația rămâne doar în acest browser. Cu un cont o vezi pe orice dispozitiv.")
+        tab_login, tab_register, tab_reset = st.tabs(["Intră", "Cont nou", "Am uitat parola"])
+        with tab_login:
+            email = st.text_input("Email", key="_auth_login_email")
+            pw = st.text_input("Parolă", type="password", key="_auth_login_pw")
+            remember = st.checkbox("Ține-mă minte", value=True, key="_auth_login_remember")
+            if st.button("Intră", key="_auth_login_btn"):
+                u, err = auth_login(email, pw)
+                if u:
+                    auth_complete_login(u, remember)
+                    st.rerun()
+                st.error(err)
+        with tab_register:
+            name = st.text_input("Nume (opțional)", key="_auth_reg_name")
+            email = st.text_input("Email", key="_auth_reg_email")
+            pw = st.text_input("Parolă (min. 8 caractere)", type="password", key="_auth_reg_pw")
+            pw2 = st.text_input("Repetă parola", type="password", key="_auth_reg_pw2")
+            remember = st.checkbox("Ține-mă minte", value=True, key="_auth_reg_remember")
+            if st.button("Creează cont", key="_auth_reg_btn"):
+                if pw != pw2:
+                    st.error("Parolele nu coincid.")
+                else:
+                    u, err = auth_register(email, pw, name)
+                    if u:
+                        auth_complete_login(u, remember)
+                        st.rerun()
+                    st.error(err)
+        with tab_reset:
+            st.caption("1️⃣ Cere un cod pe email **sau** folosește codul de recuperare primit la crearea contului.")
+            mail = st.text_input("Email", key="_auth_reset_mail_email")
+            if st.button("📧 Trimite codul", key="_auth_reset_send"):
+                okay, info = auth_request_reset_email(mail)
+                (st.success if okay else st.error)(info)
+            st.caption("2️⃣ Schimbă parola")
+            email = st.text_input("Email", key="_auth_reset_email")
+            code = st.text_input("Cod din email sau cod de recuperare", key="_auth_reset_code")
+            pw = st.text_input("Parolă nouă", type="password", key="_auth_reset_pw")
+            pw2 = st.text_input("Repetă parola nouă", type="password", key="_auth_reset_pw2")
+            if st.button("Schimbă parola", key="_auth_reset_btn"):
+                if pw != pw2:
+                    st.error("Parolele nu coincid.")
+                else:
+                    u, err = auth_reset_password(email, code, pw)
+                    if u:
+                        auth_complete_login(u, True)
+                        st.rerun()
+                    st.error(err)
+
+
+def render_conversations_ui():
+    uid = current_user_id()
+    if not uid:
+        return
+    st.header("💬 Conversațiile mele")
+    st.button("➕ Conversație nouă", key="_new_conv", width="stretch", on_click=new_session)
+    for s in list_user_sessions(uid):
+        sid = s["session_id"]
+        title = (s.get("title") or "Conversație nouă").replace("\n", " ")
+        current = sid == st.session_state.session_id
+        st.button(("▶️ " if current else "") + title[:40], key=f"_conv_{sid}", width="stretch",
+                  disabled=current, on_click=switch_session, args=(sid,))
+
+
 st.title("💪 GymBro AI")
 st.caption("Antrenorul tău personal virtual • 24/7 • Gratuit")
 
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
+
+def _reset_chat():
+    clear_history_db(st.session_state.session_id)
+    st.session_state.messages = []
+    st.session_state.pop("media", None)
+    st.session_state.uploader_key += 1
+
+
 with st.sidebar:
+    render_account_ui()
+    render_conversations_ui()
+
     st.header("⚙️ Setări")
-    if st.button("🗑️ Reset Chat", type="primary", use_container_width=True):
-        clear_history_db(st.session_state.session_id)
-        st.session_state.messages = []
-        st.rerun()
-    
+    st.button("🗑️ Reset Chat", type="primary", width="stretch", key="_reset_chat", on_click=_reset_chat)
     enable_audio = st.toggle("🔊 Activează Vocea", value=False)
-    
+
     st.divider()
     st.header("📁 Materiale")
-    uploaded_file = st.file_uploader("Încarcă Poză/PDF", type=["jpg", "jpeg", "png", "pdf"])
-    
-    media_content = None 
-    if uploaded_file and keys:
-        # Configuram o cheie temporara pentru upload
-        genai.configure(api_key=keys[st.session_state.key_index])
-        file_type = uploaded_file.type
-        if "image" in file_type:
-            media_content = Image.open(uploaded_file)
-            st.image(media_content, caption="Imagine atașată", use_container_width=True)
-        elif "pdf" in file_type:
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.getvalue())
-                    tmp_path = tmp.name
-                with st.spinner("📚 Se procesează PDF-ul..."):
-                    uploaded_pdf = genai.upload_file(tmp_path, mime_type="application/pdf")
-                    while uploaded_pdf.state.name == "PROCESSING":
-                        time.sleep(1)
-                        uploaded_pdf = genai.get_file(uploaded_pdf.name)  
-                    media_content = uploaded_pdf
-                    st.success(f"✅ Gata: {uploaded_file.name}")
-            except Exception as e:
-                st.error(f"Eroare upload PDF: {e}")
-
-# ==========================================
-# 5. CHAT LOGIC (CU AUTO-REPAIR SVG)
-# ==========================================
-
-def render_message_with_svg(content):
-    # Logica de SVG
-    if "<svg" in content and "</svg>" in content:
-        try:
-            start_idx = content.find("<svg")
-            end_idx = content.find("</svg>") + 6
-            before_svg = content[:start_idx].replace("[[DESEN_SVG]]", "")
-            svg_code = content[start_idx:end_idx]
-            after_svg = content[end_idx:].replace("[[/DESEN_SVG]]", "")
-            
-            if before_svg.strip(): st.markdown(before_svg)
-            st.markdown(f'<div class="svg-container">{svg_code}</div>', unsafe_allow_html=True)
-            if after_svg.strip(): st.markdown(after_svg)
-        except Exception as e:
-            st.markdown(content)
-            
-    # Reparatie pentru cazul in care AI-ul uita tag-ul <svg>
-    elif ("<path" in content or "<rect" in content) and ("stroke=" in content or "fill=" in content) and "<svg" not in content:
-        try:
-            clean_content = content.replace("[[DESEN_SVG]]", "").replace("[[/DESEN_SVG]]", "")
-            wrapped_svg = f'<svg viewBox="0 0 800 600" xmlns="http://www.w3.org/2000/svg" style="background-color: white;">{clean_content}</svg>'
-            st.markdown(f'<div class="svg-container">{wrapped_svg}</div>', unsafe_allow_html=True)
-        except Exception as e:
-            st.markdown(content)
+    uploaded_file = st.file_uploader(
+        "Încarcă Poză/PDF",
+        type=["jpg", "jpeg", "png", "pdf"],
+        key=f"uploader_{st.session_state.uploader_key}",
+    )
+    if uploaded_file is None:
+        st.session_state.pop("media", None)
     else:
-        st.markdown(content)
+        signature = (uploaded_file.name, uploaded_file.size)
+        media = st.session_state.get("media")
+        if not media or media["signature"] != signature:
+            data = uploaded_file.getvalue()
+            if "image" in (uploaded_file.type or ""):
+                try:
+                    Image.open(BytesIO(data)).verify()
+                    st.session_state.media = {"kind": "image", "signature": signature, "name": uploaded_file.name,
+                                              "data": data, "mime": uploaded_file.type or "image/jpeg"}
+                except Exception as e:
+                    st.session_state.pop("media", None)
+                    st.error(f"Imaginea nu poate fi citită: {e}")
+            else:
+                st.session_state.media = {"kind": "pdf", "signature": signature,
+                                          "name": uploaded_file.name, "data": data, "files": {}}
+        media = st.session_state.get("media")
+        if media and media["kind"] == "image":
+            st.image(media["data"], caption="Imagine atașată")
+        elif media:
+            st.success(f"📄 Atașat: {media['name']}")
+        if media:
+            st.caption("Materialul e trimis împreună cu fiecare mesaj până îl ștergi din listă.")
 
-# Încărcare istoric
-if "messages" not in st.session_state or not st.session_state.messages:
+    st.divider()
+    if current_user():
+        st.caption("🔒 Conversațiile contului tău le poți deschide doar tu, după ce intri în cont.")
+    else:
+        st.caption("🔒 Conversația e salvată în acest browser și pe link-ul din bara de adrese. "
+                   "Nu trimite link-ul altor persoane sau fă-ți un cont.")
+
+sync_browser_storage()
+
+if not keys:
+    st.error("❌ Nu am găsit nicio cheie API validă. Adaugă 'GOOGLE_API_KEYS' în secrets sau introdu una manual.")
+    st.stop()
+
+# ==========================================
+# 7. CHAT
+# ==========================================
+
+if "messages" not in st.session_state:
     st.session_state.messages = load_history_from_db(st.session_state.session_id)
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="💪" if msg["role"] == "assistant" else "👤"):
         if msg["role"] == "assistant":
-            render_message_with_svg(msg["content"])
+            render_message(msg["content"])
+            if msg.get("audio"):
+                st.audio(msg["audio"], format="audio/mp3")
         else:
             st.markdown(msg["content"])
 
 if user_input := st.chat_input("Salut! Vreau un program pentru spate și biceps..."):
-    st.chat_message("user", avatar="👤").write(user_input)
+    user_input = user_input.strip()
+
+if user_input:
+    st.chat_message("user", avatar="👤").markdown(user_input)
+
+    # Istoricul ÎNAINTE de mesajul curent, ultimele MAX_HISTORY_MESSAGES
+    history, pending_text = build_history(st.session_state.messages[-MAX_HISTORY_MESSAGES:])
+    text_to_send = f"{pending_text}\n\n{user_input}" if pending_text else user_input
+
     st.session_state.messages.append({"role": "user", "content": user_input})
     save_message_to_db(st.session_state.session_id, "user", user_input)
 
-    # Pregatim istoricul pentru API
-    history_obj = []
-    # Luam ultimele mesaje pentru context
-    relevant_messages = st.session_state.messages[-12:] if len(st.session_state.messages) > 12 else st.session_state.messages[:-1]
-    
-    for msg in relevant_messages:
-        role_gemini = "model" if msg["role"] == "assistant" else "user"
-        history_obj.append({"role": role_gemini, "parts": [msg["content"]]})
-
-    final_payload = []
-    if media_content:
-        final_payload.append("Analizează materialul atașat:")
-        final_payload.append(media_content)
-    final_payload.append(user_input)
-
     with st.chat_message("assistant", avatar="💪"):
         message_placeholder = st.empty()
+        message_placeholder.markdown("💭 Mă gândesc...")
         full_response = ""
         try:
-            stream_generator = run_chat_with_rotation(history_obj, final_payload)
-            for text_chunk in stream_generator:
+            last_update = 0.0
+            for text_chunk in run_chat_with_rotation(history, text_to_send):
                 full_response += text_chunk
-                
-                # Logică simplă de preview
-                if len(full_response) % 20 == 0:
-                     message_placeholder.markdown(full_response + "▌")
+                now = time.time()
+                if now - last_update > 0.1:
+                    message_placeholder.markdown(full_response + "▌")
+                    last_update = now
 
             message_placeholder.empty()
-            render_message_with_svg(full_response)
-            
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            render_message(full_response)
+
+            assistant_msg = {"role": "assistant", "content": full_response}
+            if enable_audio:
+                audio_bytes = make_audio(full_response)
+                if audio_bytes:
+                    st.audio(audio_bytes, format="audio/mp3")
+                    assistant_msg["audio"] = audio_bytes
+
+            st.session_state.messages.append(assistant_msg)
             save_message_to_db(st.session_state.session_id, "assistant", full_response)
 
-            if enable_audio:
-                # Curatam textul pentru audio
-                text_for_audio = re.sub(r'[*_#`]', '', full_response)
-                text_for_audio = re.sub(r'<.*?>', '', text_for_audio)
-                text_for_audio = text_for_audio.replace("[[DESEN_SVG]]", "").replace("[[/DESEN_SVG]]", "")
-                
-                if text_for_audio.strip():
-                    try:
-                        sound_file = BytesIO()
-                        # Marim limita la 1000 caractere
-                        tts = gTTS(text=text_for_audio[:1000], lang='ro')
-                        tts.write_to_fp(sound_file)
-                        st.audio(sound_file, format='audio/mp3')
-                    except Exception as e:
-                        print(f"Eroare audio: {e}")
-        except Exception as e:
+        except EmptyResponseError:
+            message_placeholder.empty()
+            st.warning("🤔 Nu am putut formula un răspuns la asta. Încearcă să reformulezi întrebarea.")
+        except FatalRequestError as e:
+            message_placeholder.empty()
             st.error(f"Eroare: {e}")
