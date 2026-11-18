@@ -55,6 +55,10 @@ alter table public.gym_history         enable row level security;
 revoke all on public.gym_users, public.gym_tokens, public.gym_password_resets,
               public.gym_sessions, public.gym_history from anon, authenticated;
 
+-- 18 nov. 2026: profilul utilizatorului (vârstă, nivel, obiectiv, zile, echipament, limitări)
+alter table public.gym_users    add column if not exists profile jsonb;   -- cu cont
+alter table public.gym_sessions add column if not exists profile jsonb;   -- fără cont (pe conversație)
+
 -- ROLLBACK:
 -- drop table public.gym_history; drop table public.gym_sessions; drop table public.gym_password_resets;
 -- drop table public.gym_tokens; drop table public.gym_users;

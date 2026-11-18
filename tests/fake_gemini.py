@@ -16,7 +16,7 @@ class _Models:
     def __init__(self, key): self.key = key
 
     def generate_content_stream(self, model, contents, config):
-        CALLS.append((self.key[-1], model, config.thinking_config, contents))
+        CALLS.append((self.key[-1], model, config.thinking_config, contents, config))
         rule = RULES.get((self.key, model)) or RULES.get(("*", model)) or RULES.get((self.key, "*"))
         if rule == "empty":
             return iter([pytypes.SimpleNamespace(text=None)])

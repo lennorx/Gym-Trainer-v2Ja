@@ -220,6 +220,35 @@ def list_user_sessions(user_id, limit=15):
         return []
 
 
+def load_profile(user_id=None, session_id=None):
+    """Profilul contului (gym_users.profile) sau, fără cont, al conversației (gym_sessions.profile)."""
+    if not ACCOUNTS_ENABLED:
+        return None
+    try:
+        if user_id:
+            res = SB.table("gym_users").select("profile").eq("id", user_id).limit(1).execute()
+        else:
+            res = SB.table("gym_sessions").select("profile").eq("session_id", session_id).limit(1).execute()
+        return (res.data[0].get("profile") if res.data else None) or None
+    except Exception as e:
+        _log("Citire profil eșuată", e)
+        return None
+
+
+def store_profile(profile, user_id=None, session_id=None):
+    if not ACCOUNTS_ENABLED:
+        return False
+    try:
+        if user_id:
+            SB.table("gym_users").update({"profile": profile}).eq("id", user_id).execute()
+        else:
+            SB.table("gym_sessions").update({"profile": profile}).eq("session_id", session_id).execute()
+        return True
+    except Exception as e:
+        _log("Salvare profil eșuată", e)
+        return False
+
+
 # ==========================================
 # 3. AUTENTIFICARE OPȚIONALĂ (portată din Profesor ETTI)
 # ==========================================
@@ -596,6 +625,8 @@ def auth_logout(all_devices=False):
     except Exception as e:
         _log("Ștergere token la deconectare eșuată", e)
     st.session_state.pop("_auth_user", None)
+    st.session_state.pop("profile", None)
+    st.session_state.pop("_profile_owner", None)
     if isinstance(st.session_state.get("_browser_storage"), dict):
         st.session_state["_browser_storage"]["token"] = ""
     _set_browser_token(None)
@@ -656,6 +687,60 @@ def sync_browser_storage():
     js = f"localStorage.setItem('gymbro_session_id', {json.dumps(st.session_state.session_id)});"
     js += st.session_state.get("_auth_ls_js") or ""
     components.html(f"<script>try{{{js}}}catch(e){{}}</script>", height=0)
+
+
+PROFILE_WIDGET_KEYS = {"age_group": "_prof_age", "experience": "_prof_experience", "goal": "_prof_goal",
+                       "days": "_prof_days", "equipment": "_prof_equipment", "limits": "_prof_limits"}
+
+
+def _put_profile_in_widgets(profile):
+    # Valorile widget-urilor se setează DOAR prin session_state, înainte de randare (fără value= + key=)
+    profile = profile or {}
+    for field, key in PROFILE_WIDGET_KEYS.items():
+        value = profile.get(field)
+        if field == "limits":
+            st.session_state[key] = (value or "")[:300]
+            continue
+        options = list(AGE_GROUPS) if field == "age_group" else PROFILE_FIELDS[field][1]
+        st.session_state[key] = value if value in options else None   # opțiuni redenumite → gol, nu eroare
+
+
+def ensure_profile_loaded():
+    """Încarcă profilul când se schimbă proprietarul (intrare/ieșire din cont, altă conversație anonimă).
+    La intrarea în cont, profilul completat anonim trece în cont dacă acesta nu are încă unul."""
+    uid = current_user_id()
+    owner = f"user:{uid}" if uid else f"sid:{st.session_state.session_id}"
+    previous = st.session_state.get("_profile_owner")
+    if previous == owner:
+        return
+    anon_profile = st.session_state.get("profile") if (previous or "").startswith("sid:") else None
+    profile = load_profile(user_id=uid) if uid else load_profile(session_id=st.session_state.session_id)
+    if uid and not profile and anon_profile:
+        store_profile(anon_profile, user_id=uid)
+        profile = anon_profile
+    if not uid and not profile and previous is None:
+        profile = st.session_state.get("profile")      # rulare locală fără Supabase
+    st.session_state["profile"] = profile or {}
+    st.session_state["_profile_owner"] = owner
+    _put_profile_in_widgets(profile)
+
+
+def save_profile_from_widgets():
+    profile = {}
+    for field, key in PROFILE_WIDGET_KEYS.items():
+        value = st.session_state.get(key)
+        if isinstance(value, str):
+            value = value.strip()[:300]
+        if value:
+            profile[field] = value
+    st.session_state["profile"] = profile
+    uid = current_user_id()
+    stored = store_profile(profile, user_id=uid) if uid else \
+        store_profile(profile, session_id=st.session_state.session_id)
+    st.session_state["_profile_saved_msg"] = (
+        "✅ Profil salvat. Îl folosesc de la următorul mesaj." if stored or not ACCOUNTS_ENABLED
+        else "⚠️ Profilul e folosit acum, dar nu l-am putut salva în baza de date."
+    )
 
 
 load_browser_storage_and_login()
@@ -792,9 +877,10 @@ def _thinking_config_for(model_name):
     return types.ThinkingConfig(thinking_level="low")
 
 
-# --- PROMPT-UL SISTEMULUI (Optimizat pentru adolescenți) ---
-SYSTEM_PROMPT = """
-Ești un Antrenor Personal Virtual și Nutriționist numit "GymBro AI", specializat în lucrul cu adolescenții.
+# --- PROMPT-UL SISTEMULUI: bază comună + reguli după vârstă + profilul utilizatorului ---
+BASE_PROMPT = """
+Ești un Antrenor Personal Virtual și Nutriționist numit "GymBro AI". Lucrezi cu oameni de TOATE vârstele
+(copii, adolescenți, adulți, vârstnici) și îți adaptezi sfaturile la vârsta, nivelul și obiectivul fiecăruia.
 
 IDENTITATE:
 1. Folosește EXCLUSIV genul masculin când vorbești despre tine.
@@ -806,39 +892,144 @@ TON ȘI ADRESARE:
 3. Vorbește DIRECT, la persoana I singular ("Eu cred", "Te ajut", "Sunt pregătit").
    - GREȘIT: "Domnul Antrenor este aici." / "Antrenorul te va ajuta."
 4. Adresează-te utilizatorului direct, la persoana a II-a ("Tu trebuie să faci").
-5. Prietenos, motivațional, clar, "cool" dar responsabil. Folosește emoji-uri 💪🥗🔥 cu măsură.
+5. Prietenos, motivațional, clar, responsabil. Folosește emoji-uri 💪🥗🔥 cu măsură.
+   Potrivește tonul cu vârsta: mai relaxat cu tinerii, mai așezat cu adulții și vârstnicii.
 6. Fii cald, natural și scurt. Evită introducerile pompoase.
 7. NU SALUTA în fiecare mesaj. Salută DOAR la începutul unei conversații noi.
 
 REGULI DE AUR:
 1. Pentru programe de antrenament folosește OBLIGATORIU tabele Markdown.
-2. (CRITIC) Nu recomanda NICIODATĂ suplimente: creatină, steroizi, proteine pudră, pre-workout,
-   "fat burners", băuturi energizante sau orice altă pastilă/pulbere. Doar mâncare reală.
-3. Dacă utilizatorul e începător, insistă pe forma corectă, nu pe greutăți mari.
-4. Nutriție: mâncare reală, naturală și variată, cu exemple concrete de mese și gustări.
+2. Forma corectă înaintea greutății. Progresie treptată: crești încărcătura doar când toate seriile
+   ies curat, cu tehnică bună.
+3. Nutriție: mâncare reală și variată, cu exemple concrete de mese și gustări (inclusiv mâncare
+   obișnuită în România și variante ieftine de proteine: ouă, iaurt, brânză, fasole, linte, pui, pește).
+4. Fii realist și nu fi ca influencerii de fitness: fără promisiuni de transformări rapide.
+5. Dacă nu știi vârsta, obiectivul sau echipamentul și contează pentru răspuns, întreabă scurt.
 
-SIGURANȚĂ (CRITIC, utilizatorii sunt adolescenți):
-1. Progresia este treptată. Pentru cei mai mici de 16 ani recomandă în primul rând exerciții cu greutatea
-   corpului, iar la greutăți libere spune-le să lucreze sub supravegherea unui antrenor sau a unui adult.
-2. Fără diete restrictive, fără deficit caloric mare, fără post, fără numărat obsesiv de calorii
-   sau cântărit zilnic. Nu da ținte de greutate corporală.
-3. Dacă utilizatorul pomenește durere, o accidentare, amețeli, leșin, probleme cu inima sau o boală,
-   spune-i să oprească efortul și să meargă la medic sau kinetoterapeut și să anunțe un părinte.
-   Nu pune diagnostice.
-4. Dacă observi semne de relație nesănătoasă cu mâncarea sau cu propriul corp (vrea să slăbească extrem
+REPERE GENERALE (ghidurile OMS pentru activitate fizică):
+- 5–17 ani: în medie 60 de minute pe zi de activitate moderată sau intensă; exerciții intense și
+  pentru mușchi și oase de cel puțin 3 ori pe săptămână.
+- 18–64 ani: 150–300 de minute pe săptămână de activitate moderată (sau 75–150 intensă) și exerciții
+  de forță pentru toate grupele mari de mușchi de cel puțin 2 ori pe săptămână.
+- 65+ ani: la fel ca adulții, plus exerciții de echilibru și forță funcțională de cel puțin 3 ori pe săptămână.
+
+SIGURANȚĂ (TOATE VÂRSTELE):
+1. Dacă utilizatorul pomenește durere, o accidentare, amețeli, leșin, dureri în piept, lipsă de aer
+   neobișnuită sau o boală, spune-i să oprească efortul și să meargă la medic sau kinetoterapeut.
+   La dureri în piept sau leșin: 112. Nu pune diagnostice.
+2. Fără diete extreme, fără post prelungit, fără metode de "slăbit rapid" sau de deshidratare.
+3. Dacă observi semne de relație nesănătoasă cu mâncarea sau cu propriul corp (vrea să slăbească extrem
    de repede, sare peste mese, vomită după masă, face sport ca să "ardă" ce a mâncat, se urăște pentru
-   cum arată), răspunde cu căldură, fără planuri de slăbit, încurajează-l să vorbească cu un părinte,
-   un medic sau consilierul școlar și menționează Telefonul Copilului: 116 111 (gratuit).
+   cum arată), răspunde cu căldură, NU oferi planuri de slăbit și încurajează-l să vorbească cu un medic
+   sau un psiholog (iar un minor și cu un părinte sau consilierul școlar).
+4. Niciodată steroizi anabolizanți, SARMs, prohormoni, "fat burners", diuretice sau laxative pentru
+   slăbit, la nicio vârstă.
 
 OBIECTIVELE TALE:
-1. Să creezi planuri de antrenament organizate pe ZILE și SĂPTĂMÂNI.
+1. Să creezi planuri de antrenament organizate pe ZILE și SĂPTĂMÂNI, potrivite vârstei și nivelului.
 2. Să explici corect execuția exercițiilor pentru a evita accidentările.
-3. Să oferi sfaturi nutriționale sănătoase (fără diete extreme, focus pe proteine și energie din mâncare).
-4. Să răspunzi la întrebări despre sală sau exerciții acasă.
-5. Să fii realist și să nu fii ca influencerii de fitness.
+3. Să oferi sfaturi nutriționale sănătoase și sustenabile.
+4. Să răspunzi la întrebări despre sală, exerciții acasă, sport și recuperare.
 """
 
-# Filtre de siguranță: aplicația e pentru adolescenți, deci NU le dezactivăm
+AGE_GROUPS = {
+    "u14": "sub 14 ani",
+    "14-17": "14–17 ani",
+    "18-39": "18–39 ani",
+    "40-64": "40–64 ani",
+    "65+": "65 de ani sau peste",
+}
+
+_MINOR_RULES = """
+2. (CRITIC) Nu recomanda NICIODATĂ suplimente: creatină, proteine pudră, pre-workout, băuturi energizante
+   sau orice altă pastilă/pulbere. Doar mâncare reală.
+3. Fără deficit caloric, fără numărat obsesiv de calorii sau cântărit zilnic, fără ținte de greutate
+   corporală: corpul încă se dezvoltă.
+4. La durere sau orice problemă de sănătate: să anunțe și un părinte.
+5. La semne de relație nesănătoasă cu mâncarea sau corpul, menționează și Telefonul Copilului:
+   116 111 (gratuit).
+"""
+
+AGE_RULES = {
+    "u14": """
+REGULI PENTRU VÂRSTA UTILIZATORULUI (sub 14 ani):
+1. Accent pe joacă, sport și mișcare variată. Forța se lucrează mai ales cu greutatea corpului
+   (genuflexiuni, flotări ușurate, plank, sărituri); greutăți libere DOAR sub supravegherea unui
+   antrenor sau a unui adult, cu încărcătură mică și multe repetări corecte.
+""" + _MINOR_RULES,
+    "14-17": """
+REGULI PENTRU VÂRSTA UTILIZATORULUI (14–17 ani):
+1. Antrenamentul de forță e sigur și util dacă tehnica e corectă și progresia treptată. Pentru cei sub 16
+   ani, la greutăți libere recomandă supravegherea unui antrenor sau a unui adult.
+""" + _MINOR_RULES,
+    "18-39": """
+REGULI PENTRU VÂRSTA UTILIZATORULUI (18–39 ani):
+1. Poți folosi programe clasice (full body, upper/lower, push/pull/legs), suprasarcină progresivă,
+   perioade de descărcare.
+2. Suplimente: mâncarea vine întâi. Dacă te întreabă, poți explica obiectiv proteina pudră (o simplă
+   comoditate) și creatina monohidrat (cel mai studiat supliment, dozele uzuale), fără să insiști.
+   Recomandă medicul înainte de orice supliment dacă are o boală (ex. de rinichi) sau ia medicamente.
+3. Slăbit: deficit moderat, sustenabil (fără regimuri extreme), cu proteine suficiente și antrenament
+   de forță ca să-și păstreze masa musculară.
+""",
+    "40-64": """
+REGULI PENTRU VÂRSTA UTILIZATORULUI (40–64 ani):
+1. Încălzire mai lungă, accent pe mobilitate, articulații și recuperare (somn, zile de pauză).
+2. Dacă a fost sedentar mult timp, are tensiune mare, boli de inimă, diabet sau alte afecțiuni,
+   recomandă un control medical înainte de a crește intensitatea.
+3. Forța e foarte importantă la această vârstă (masă musculară, oase); progresie treptată.
+4. Suplimente: mâncarea vine întâi; informații obiective doar dacă întreabă, plus discuția cu medicul
+   dacă ia medicamente.
+5. Slăbit: deficit moderat și sustenabil, nu regimuri extreme.
+""",
+    "65+": """
+REGULI PENTRU VÂRSTA UTILIZATORULUI (65+ ani):
+1. Prioritate: echilibru, prevenirea căderilor, forță funcțională (ridicatul de pe scaun, urcatul
+   scărilor, mersul), mobilitate.
+2. Recomandă acordul medicului înainte de un program nou, mai ales cu boli cronice sau medicamente.
+3. Început foarte blând, progresie lentă, sprijin la nevoie (scaun, perete). Fără sărituri sau
+   mișcări bruște până nu e sigur pe echilibru.
+4. Fără slăbit agresiv: la această vârstă pierderea de mușchi e un risc; proteine suficiente.
+5. Suplimente doar după discuția cu medicul.
+""",
+    None: """
+VÂRSTA UTILIZATORULUI NU E CUNOSCUTĂ:
+1. La începutul conversației, întreabă scurt ce vârstă are (sau să completeze "🏋️ Profilul meu" din
+   bară), ca să-ți adaptezi sfaturile.
+2. Până afli vârsta, aplică regulile prudente: fără suplimente, fără deficit caloric, fără ținte de
+   greutate, progresie foarte treptată.
+""",
+}
+
+PROFILE_FIELDS = {
+    "experience": ("Nivel", ["Începător", "Intermediar", "Avansat"]),
+    "goal": ("Obiectiv", ["Sănătate și condiție fizică", "Forță", "Masă musculară", "Slăbit sănătos",
+                          "Rezistență / cardio", "Mobilitate și postură", "Pregătire pentru un sport"]),
+    "days": ("Zile de antrenament pe săptămână", ["1", "2", "3", "4", "5", "6"]),
+    "equipment": ("Unde te antrenezi", ["Sală complet echipată", "Acasă, cu gantere / benzi",
+                                        "Doar cu greutatea corpului", "În aer liber"]),
+}
+
+
+def build_system_prompt(profile):
+    profile = profile or {}
+    group = profile.get("age_group") if profile.get("age_group") in AGE_GROUPS else None
+    prompt = BASE_PROMPT + AGE_RULES[group]
+    lines = []
+    if group:
+        lines.append(f"- Vârstă: {AGE_GROUPS[group]}")
+    for field, (label, _options) in PROFILE_FIELDS.items():
+        if profile.get(field):
+            lines.append(f"- {label}: {profile[field]}")
+    if (profile.get("limits") or "").strip():
+        lines.append(f"- Accidentări / limitări / afecțiuni spuse de utilizator: {profile['limits'].strip()[:300]}")
+    if lines:
+        prompt += ("\nPROFILUL UTILIZATORULUI (completat de el; folosește-l, nu-l mai întreba ce știi deja):\n"
+                   + "\n".join(lines) + "\n")
+    return prompt
+
+
+# Filtre de siguranță: aplicația are și utilizatori minori, deci NU le dezactivăm
 SAFETY_SETTINGS = [
     types.SafetySetting(category=category, threshold=types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE)
     for category in (
@@ -928,7 +1119,7 @@ def run_chat_with_rotation(history, user_text):
             parts.append(types.Part(text=user_text))
             contents = history + [types.UserContent(parts=parts)]
             config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=build_system_prompt(st.session_state.get("profile")),
                 safety_settings=SAFETY_SETTINGS,
                 thinking_config=_thinking_config_for(model_name),
             )
@@ -1161,6 +1352,25 @@ def render_account_ui():
                     st.error(err)
 
 
+def render_profile_ui():
+    profile = st.session_state.get("profile") or {}
+    title = "🏋️ Profilul meu" + ("" if profile.get("age_group") else " (completează vârsta)")
+    with st.expander(title, expanded=False):
+        st.caption("Antrenorul își adaptează sfaturile după vârstă, nivel și obiectiv. Toate câmpurile sunt opționale.")
+        st.selectbox("Vârstă", list(AGE_GROUPS), format_func=AGE_GROUPS.get, index=None,
+                     placeholder="Alege grupa de vârstă", key=PROFILE_WIDGET_KEYS["age_group"])
+        for field, (label, options) in PROFILE_FIELDS.items():
+            st.selectbox(label, options, index=None, placeholder="Alege", key=PROFILE_WIDGET_KEYS[field])
+        st.text_area("Accidentări, dureri sau afecțiuni de care să țin cont", max_chars=300,
+                     placeholder="ex. mă doare genunchiul stâng la genuflexiuni", key=PROFILE_WIDGET_KEYS["limits"])
+        st.button("💾 Salvează profilul", key="_prof_save", on_click=save_profile_from_widgets)
+        msg = st.session_state.pop("_profile_saved_msg", None)
+        if msg:
+            st.caption(msg)
+        if not current_user():
+            st.caption("Fără cont, profilul rămâne la această conversație. Cu un cont îl ai pe orice dispozitiv.")
+
+
 def render_conversations_ui():
     uid = current_user_id()
     if not uid:
@@ -1176,7 +1386,7 @@ def render_conversations_ui():
 
 
 st.title("💪 GymBro AI")
-st.caption("Antrenorul tău personal virtual • 24/7 • Gratuit")
+st.caption("Antrenorul tău personal virtual • pentru orice vârstă • 24/7 • Gratuit")
 
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
@@ -1189,8 +1399,11 @@ def _reset_chat():
     st.session_state.uploader_key += 1
 
 
+ensure_profile_loaded()
+
 with st.sidebar:
     render_account_ui()
+    render_profile_ui()
     render_conversations_ui()
 
     st.header("⚙️ Setări")
