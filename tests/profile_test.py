@@ -30,7 +30,8 @@ row = next(s for s in DB["gym_sessions"] if s["session_id"] == sid)
 ok((row.get("profile") or {}).get("age_group") == "18-39", "fără cont: profilul e salvat pe conversație")
 say(a, "Fă-mi un program")
 p = prompt_last()
-ok("18–39 ani" in p and "creatina monohidrat" in p and "116 111" not in p, "18–39: reguli de adult, informații despre creatină doar la cerere")
+ok("18–39 ani" in p and "116 111" not in p, "18–39: reguli de adult (fără regulile de minori)")
+ok("NICIODATĂ suplimente: creatină, proteină pudră" in p and "creatina monohidrat" not in p, "18–39: tot fără creatină / proteină pudră")
 ok("Intermediar" in p and "Masă musculară" in p and "4" in p and "umărul drept" in p, "nivelul, obiectivul, zilele și limitările ajung la model")
 
 set_profile(a, age_group="14-17")
@@ -48,6 +49,7 @@ set_profile(a, age_group="40-64")
 say(a, "Program pentru mine")
 ok("control medical" in prompt_last(), "40–64: control medical dacă a fost sedentar / are afecțiuni")
 ok("steroizi anabolizanți" in prompt_last(), "steroizii sunt interziși la orice vârstă")
+ok("NICIODATĂ suplimente: creatină, proteină pudră" in prompt_last(), "40–64: tot fără creatină / proteină pudră")
 
 # conversația redeschisă își păstrează profilul
 b = app({}, sid_url=sid)
