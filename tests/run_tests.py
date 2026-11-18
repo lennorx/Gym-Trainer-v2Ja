@@ -28,6 +28,7 @@ SUITE = {
     "reset_test": SUPABASE + KEYS,
     "rot_test": SUPABASE + KEYS,
     "chat_test": SUPABASE + KEYS,
+    "profile_test": SUPABASE + KEYS,
     "local_test": KEYS,            # fără Supabase: SQLite, fără conturi
 }
 

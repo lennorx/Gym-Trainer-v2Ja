@@ -1,6 +1,11 @@
 # GymBro AI
 
-Antrenor personal virtual pentru adolescenți (Streamlit + Gemini + Supabase).
+Antrenor personal virtual pentru orice vârstă (Streamlit + Gemini + Supabase).
+
+Sfaturile se adaptează după profil („🏋️ Profilul meu”): grupa de vârstă (sub 14, 14–17, 18–39, 40–64, 65+),
+nivel, obiectiv, zile pe săptămână, echipament și limitări. Fără vârstă completată, antrenorul o cere și
+aplică regulile prudente (fără suplimente, fără deficit caloric). Profilul stă pe cont (`gym_users.profile`)
+sau, fără cont, pe conversație (`gym_sessions.profile`).
 
 ## Rulare locală
 
